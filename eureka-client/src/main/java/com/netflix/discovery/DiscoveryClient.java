@@ -88,9 +88,17 @@ import com.netflix.servo.monitor.Monitors;
 import com.netflix.servo.monitor.Stopwatch;
 
 /**
+ *
+ * 这个类的作用对和server的交互
  * The class that is instrumental for interactions with <tt>Eureka Server</tt>.
  *
  * <p>
+ * 客户端的一些作用：
+ * 1.  向server注册一些实例
+ * 2.  重新给server续约
+ * 3.  下线的时候下线
+ * 向server查询有哪些节点注册了
+ *
  * <tt>Eureka Client</tt> is responsible for a) <em>Registering</em> the
  * instance with <tt>Eureka Server</tt> b) <em>Renewal</em>of the lease with
  * <tt>Eureka Server</tt> c) <em>Cancellation</em> of the lease from
@@ -100,6 +108,8 @@ import com.netflix.servo.monitor.Stopwatch;
  * <tt>Eureka Server</tt>
  * <p>
  *
+ * 1. 需要给server配置有哪些server
+ * 2. 会有一个失败的保底IP列表提供
  * <p>
  * <tt>Eureka Client</tt> needs a configured list of <tt>Eureka Server</tt>
  * {@link java.net.URL}s to talk to.These {@link java.net.URL}s are typically amazon elastic eips
@@ -152,6 +162,9 @@ public class DiscoveryClient implements EurekaClient {
     private final Provider<HealthCheckHandler> healthCheckHandlerProvider;
     private final Provider<HealthCheckCallback> healthCheckCallbackProvider;
     private final PreRegistrationHandler preRegistrationHandler;
+    /**
+     * 服务端的一些信息放在里面
+     * */
     private final AtomicReference<Applications> localRegionApps = new AtomicReference<Applications>();
     private final Lock fetchRegistryUpdateLock = new ReentrantLock();
     // monotonically increasing generation counter to ensure stale threads do not reset registry to an older version
@@ -350,6 +363,8 @@ public class DiscoveryClient implements EurekaClient {
 
         fetchRegistryGeneration = new AtomicLong(0);
 
+        //获取远端的一些相关信息， 从配置文件里面进行获取
+        //TODO 需要知道配置文件存放了哪些， 配置文件存放了哪些
         remoteRegionsToFetch = new AtomicReference<String>(clientConfig.fetchRegistryForRemoteRegions());
         remoteRegionsRef = new AtomicReference<>(remoteRegionsToFetch.get() == null ? null : remoteRegionsToFetch.get().split(","));
 
@@ -414,6 +429,7 @@ public class DiscoveryClient implements EurekaClient {
             );  // use direct handoff
 
             eurekaTransport = new EurekaTransport();
+            //初始化eurekaTransport的相关信息， 用于发送请求的一些信息
             scheduleServerEndpointTask(eurekaTransport, args);
 
             AzToRegionMapper azToRegionMapper;
@@ -971,6 +987,12 @@ public class DiscoveryClient implements EurekaClient {
             // applications
             Applications applications = getApplications();
 
+            /**
+             *  增量是否禁用
+             *  某个region是否不为空，需要对该region表示特别关系
+             *  是否指定了全量更新
+             *  本地没有最近的服务列表
+             * */
             if (clientConfig.shouldDisableDelta()
                     || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))
                     || forceFullRegistryFetch
@@ -985,8 +1007,10 @@ public class DiscoveryClient implements EurekaClient {
                 logger.info("Registered Applications size is zero : {}",
                         (applications.getRegisteredApplications().size() == 0));
                 logger.info("Application version is -1: {}", (applications.getVersion() == -1));
+                //全量更新
                 getAndStoreFullRegistry();
             } else {
+                //增量更新
                 getAndUpdateDelta(applications);
             }
             applications.setAppsHashCode(applications.getReconcileHashCode());
@@ -1069,6 +1093,12 @@ public class DiscoveryClient implements EurekaClient {
 
         logger.info("Getting all instance registry info from the eureka server");
 
+        /**
+         * 直接调用发请求获取全量更新
+         * 给server发请求获取全量的server列表
+         * 响应就是application实体
+         * TODO 需要只知道请求是发给谁了，然后在服务端去看如何保证server之间是同步的
+         * */
         Applications apps = null;
         EurekaHttpResponse<Applications> httpResponse = clientConfig.getRegistryRefreshSingleVipAddress() == null
                 ? eurekaTransport.queryClient.getApplications(remoteRegionsRef.get())
@@ -1105,6 +1135,7 @@ public class DiscoveryClient implements EurekaClient {
         long currentUpdateGeneration = fetchRegistryGeneration.get();
 
         Applications delta = null;
+        //TODO 发请求获取增量更新
         EurekaHttpResponse<Applications> httpResponse = eurekaTransport.queryClient.getDelta(remoteRegionsRef.get());
         if (httpResponse.getStatusCode() == Status.OK.getStatusCode()) {
             delta = httpResponse.getEntity();
@@ -1268,12 +1299,15 @@ public class DiscoveryClient implements EurekaClient {
 
     /**
      * Initializes all scheduled tasks.
+     * 初始化线程任务， 核心
      */
     private void initScheduledTasks() {
+        //定时从远端拉取，默认为1秒，每秒钟定时初始化
         if (clientConfig.shouldFetchRegistry()) {
             // registry cache refresh timer
             int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();
             int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();
+            //初始化缓存
             cacheRefreshTask = new TimedSupervisorTask(
                     "cacheRefresh",
                     scheduler,
@@ -1288,12 +1322,14 @@ public class DiscoveryClient implements EurekaClient {
                     registryFetchIntervalSeconds, TimeUnit.SECONDS);
         }
 
+        //定时向远端注册
         if (clientConfig.shouldRegisterWithEureka()) {
             int renewalIntervalInSecs = instanceInfo.getLeaseInfo().getRenewalIntervalInSecs();
             int expBackOffBound = clientConfig.getHeartbeatExecutorExponentialBackOffBound();
             logger.info("Starting heartbeat executor: " + "renew interval is: {}", renewalIntervalInSecs);
 
             // Heartbeat timer
+            //心跳同步
             heartbeatTask = new TimedSupervisorTask(
                     "heartbeat",
                     scheduler,
@@ -1429,6 +1465,7 @@ public class DiscoveryClient implements EurekaClient {
 
     /**
      * The heartbeat task that renews the lease in the given intervals.
+     * 续约
      */
     private class HeartbeatThread implements Runnable {
 
@@ -1486,6 +1523,7 @@ public class DiscoveryClient implements EurekaClient {
             boolean remoteRegionsModified = false;
             // This makes sure that a dynamic change to remote regions to fetch is honored.
             String latestRemoteRegions = clientConfig.fetchRegistryForRemoteRegions();
+            //没有做region 和 zone的区分，可以不用考虑做区分 latestRemoteRegions = null
             if (null != latestRemoteRegions) {
                 String currentRemoteRegions = remoteRegionsToFetch.get();
                 if (!latestRemoteRegions.equals(currentRemoteRegions)) {
